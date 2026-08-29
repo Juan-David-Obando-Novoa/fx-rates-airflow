@@ -1,0 +1,62 @@
+# Local Airflow + a separate Postgres warehouse.
+# Airflow keeps its own metadata in `airflow-db`; the pipeline writes to `warehouse-db`.
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+  # Connection the DAG uses, injected as an env var so there is nothing to click in the UI.
+  AIRFLOW_CONN_WAREHOUSE: postgresql://warehouse:warehouse@warehouse-db:5432/warehouse
+
+services:
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+
+  warehouse-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse
+      POSTGRES_DB: warehouse
+    ports:
+      - "5433:5432"          # psql -h localhost -p 5433 -U warehouse
+    volumes:
+      - warehouse-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "warehouse"]
+      interval: 5s
+      retries: 10
+
+  airflow:
+    build: .
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      warehouse-db:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./sql:/opt/airflow/sql
+      - airflow-logs:/opt/airflow/logs
+    command: >
+      bash -c "airflow db migrate && exec airflow standalone"
+
+volumes:
+  airflow-db-data:
+  warehouse-db-data:
+  airflow-logs:
