@@ -1,13 +1,21 @@
 -- One row of assertions for the date this run just loaded.
-WITH target AS (
-    SELECT (payload ->> 'date')::date AS rate_date
-    FROM raw.fx_rates_raw
+WITH staged AS (
+    SELECT *
+    FROM staging.fx_rates_validated
     WHERE logical_date = %(logical_date)s::date
+),
+loaded AS (
+    -- What actually landed in the warehouse for the date(s) this run cleaned.
+    SELECT f.quote_currency
+    FROM analytics.fx_rates AS f
+    WHERE f.rate_date IN (SELECT rate_date FROM staged WHERE rejection_reason IS NULL)
+      AND f.quote_currency = ANY(%(expected_quotes)s)
 )
 SELECT
-    count(*)                                     AS row_count,
-    count(*) FILTER (WHERE f.rate IS NULL)       AS null_rates,
-    count(*) FILTER (WHERE f.rate <= 0)          AS non_positive_rates,
-    count(DISTINCT f.quote_currency)             AS distinct_quotes
-FROM analytics.fx_rates AS f
-JOIN target AS t ON f.rate_date = t.rate_date;
+    (SELECT count(*) FROM staged)                                   AS staged_rows,
+    (SELECT count(*) FROM staged WHERE rejection_reason IS NOT NULL) AS rejected_rows,
+    (SELECT array_agg(DISTINCT quote_currency) FROM loaded)          AS covered_quotes,
+    (SELECT string_agg(coalesce(quote_currency, '?') || ' ' || rejection_reason, ', '
+                       ORDER BY quote_currency)
+     FROM staged
+     WHERE rejection_reason IS NOT NULL)                             AS rejection_summary;

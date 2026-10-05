@@ -3,11 +3,13 @@ fx_rates_elt
 ============
 
 Daily ELT pipeline that lands ECB foreign-exchange reference rates into a
-Postgres warehouse and builds a small analytics mart on top of them.
+Postgres warehouse, cleans and validates them, and builds two analytics marts.
 
 Flow
 ----
-    create_schema -> extract -> load_raw -> transform -> quality_checks -> build_mart
+    create_schema -> extract -> load_raw -> clean -> transform -> quality_checks
+                                                                  -> build_mart
+                                                                  -> build_filled_mart
 
 Design notes
 ------------
@@ -16,10 +18,15 @@ Design notes
 * The raw JSON payload is stored untouched in `raw.fx_rates_raw` before any
   parsing happens. If the transform logic changes we replay from raw instead
   of re-hitting the API.
+* Cleaning happens in its own layer (`staging.fx_rates_validated`): values are
+  standardized, cast defensively and checked against validation rules. Rows
+  that fail are quarantined with a reason instead of being dropped silently.
+  Only clean rows are promoted to `analytics.fx_rates`.
 * The API publishes on TARGET business days only. A weekend request returns
   the previous business day's rates, so the warehouse is keyed on the *date
   the API reports*, not on the Airflow logical date. Duplicates collapse via
-  the primary key.
+  the primary key. The gaps are filled for BI in `analytics.fx_rates_daily_filled`
+  with forward fill, and every imputed row is labelled as such.
 """
 
 from __future__ import annotations
@@ -42,8 +49,12 @@ API_BASE_URL = "https://api.frankfurter.dev/v1"
 BASE_CURRENCY = "USD"
 QUOTE_CURRENCIES = ["CAD", "EUR", "GBP", "BRL", "MXN"]
 
+# How long a reference rate stays usable. Covers the longest TARGET closure
+# (Good Friday to Easter Monday). Older rates are rejected as stale by `clean`
+# and are never carried forward by `build_filled_mart`.
+MAX_RATE_AGE_DAYS = 5
+
 REQUEST_TIMEOUT_SECONDS = 30
-MIN_EXPECTED_ROWS = len(QUOTE_CURRENCIES)
 
 
 def read_sql(filename: str) -> str:
@@ -53,7 +64,7 @@ def read_sql(filename: str) -> str:
 
 @dag(
     dag_id="fx_rates_elt",
-    description="Daily FX reference rates: API -> raw -> analytics -> mart",
+    description="Daily FX reference rates: API -> raw -> clean -> analytics -> marts",
     schedule="0 6 * * *",
     start_date=datetime(2026, 8, 3),
     catchup=True,
@@ -100,8 +111,25 @@ def fx_rates_elt():
         )
 
     @task
+    def clean(target_date: str) -> None:
+        """Standardize, validate and quarantine the raw rows for `target_date`."""
+        PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID).run(
+            read_sql("clean.sql"),
+            parameters={
+                "logical_date": target_date,
+                "base_currency": BASE_CURRENCY,
+                "expected_quotes": QUOTE_CURRENCIES,
+                "max_rate_age_days": MAX_RATE_AGE_DAYS,
+            },
+            # clean.sql is DELETE + INSERT. psycopg 3 sends parameterized SQL as
+            # a prepared statement, which takes one command at a time. The hook
+            # runs both on one connection and commits once, so it stays atomic.
+            split_statements=True,
+        )
+
+    @task
     def transform(target_date: str) -> None:
-        """Flatten the JSON payload into the analytics.fx_rates table."""
+        """Promote the rows that passed cleaning into analytics.fx_rates."""
         PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID).run(
             read_sql("transform.sql"),
             parameters={"logical_date": target_date},
@@ -109,56 +137,67 @@ def fx_rates_elt():
 
     @task
     def quality_checks(target_date: str) -> None:
-        """Fail the run if the loaded data does not meet expectations."""
+        """Fail the run if a currency the business needs did not make it through."""
         hook = PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID)
-        row = hook.get_first(
+        staged_rows, rejected_rows, covered_quotes, rejection_summary = hook.get_first(
             read_sql("quality_checks.sql"),
-            parameters={"logical_date": target_date},
+            parameters={"logical_date": target_date, "expected_quotes": QUOTE_CURRENCIES},
         )
-        row_count, null_rates, non_positive, distinct_quotes = row
+        missing = sorted(set(QUOTE_CURRENCIES) - set(covered_quotes or []))
 
         failures = []
-        if row_count < MIN_EXPECTED_ROWS:
-            failures.append(f"expected at least {MIN_EXPECTED_ROWS} rows, found {row_count}")
-        if null_rates:
-            failures.append(f"{null_rates} null rate(s)")
-        if non_positive:
-            failures.append(f"{non_positive} non-positive rate(s)")
-        if distinct_quotes < len(QUOTE_CURRENCIES):
-            failures.append(
-                f"expected {len(QUOTE_CURRENCIES)} currencies, found {distinct_quotes}"
-            )
+        if staged_rows == 0:
+            failures.append("the payload produced no rows")
+        if missing:
+            failures.append(f"missing currencies: {', '.join(missing)}")
 
         if failures:
+            detail = f" | quarantined: {rejection_summary}" if rejection_summary else ""
             raise AirflowFailException(
-                f"Data quality checks failed for {target_date}: " + "; ".join(failures)
+                f"Data quality checks failed for {target_date}: " + "; ".join(failures) + detail
+            )
+
+        if rejected_rows:
+            # Not fatal: e.g. the API sent a currency nobody asked for.
+            log.warning(
+                "%s row(s) quarantined for %s: %s", rejected_rows, target_date, rejection_summary
             )
 
         log.info(
-            "Quality checks passed for %s: %s rows, %s currencies",
+            "Quality checks passed for %s: %s currencies loaded, %s row(s) quarantined",
             target_date,
-            row_count,
-            distinct_quotes,
+            len(QUOTE_CURRENCIES),
+            rejected_rows,
         )
 
     @task
     def build_mart() -> None:
-        """Rebuild the day-over-day change mart with a window function."""
+        """Rebuild the day-over-day change mart, flagging outlier moves."""
         PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID).run(read_sql("mart.sql"))
+
+    @task
+    def build_filled_mart() -> None:
+        """Rebuild the calendar-complete series (forward fill, labelled)."""
+        PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID).run(
+            read_sql("mart_filled.sql"),
+            parameters={"max_rate_age_days": MAX_RATE_AGE_DAYS},
+        )
 
     # The logical date of each run, rendered by Airflow at execution time.
     target_date = "{{ ds }}"
 
     payload = extract(target_date)
+    checks = quality_checks(target_date)
 
     (
         create_schema()
         >> payload
         >> load_raw(payload, target_date)
+        >> clean(target_date)
         >> transform(target_date)
-        >> quality_checks(target_date)
-        >> build_mart()
+        >> checks
     )
+    checks >> [build_mart(), build_filled_mart()]
 
 
 fx_rates_elt()
