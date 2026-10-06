@@ -4,7 +4,7 @@
 --   raw        bronze  API response exactly as it arrived
 --   staging    silver  every parsed row with its cleaning verdict (audit trail)
 --   analytics  silver  clean, validated rates only
---   analytics  gold    marts that a BI tool sits on
+--   analytics  gold    marts (facts) and dimensions that a BI tool sits on
 
 CREATE SCHEMA IF NOT EXISTS raw;
 CREATE SCHEMA IF NOT EXISTS staging;
@@ -72,4 +72,24 @@ CREATE TABLE IF NOT EXISTS analytics.fx_rates_daily_filled (
     fill_status      text          NOT NULL
                      CHECK (fill_status IN ('observed', 'imputed', 'missing')),
     PRIMARY KEY (calendar_date, base_currency, quote_currency)
+);
+
+-- Dimension: one row per tracked quote currency (reference data).
+CREATE TABLE IF NOT EXISTS analytics.dim_currency (
+    currency_code text PRIMARY KEY,
+    currency_name text NOT NULL,
+    region        text NOT NULL
+);
+
+-- Dimension: one row per calendar day covered by the marts.
+CREATE TABLE IF NOT EXISTS analytics.dim_date (
+    date_day        date    PRIMARY KEY,
+    year            int     NOT NULL,
+    quarter         int     NOT NULL,
+    month           int     NOT NULL,
+    month_label     text    NOT NULL,   -- 'YYYY-MM', sorts correctly as text
+    iso_week        int     NOT NULL,
+    iso_day_of_week int     NOT NULL,   -- 1 = Monday ... 7 = Sunday
+    day_name        text    NOT NULL,
+    is_weekend      boolean NOT NULL
 );

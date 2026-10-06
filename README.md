@@ -11,10 +11,11 @@ Built to be run locally with one command.
 ┌──────────────┐   ┌─────────────────┐   ┌──────────────────────────┐   ┌────────────────────┐   ┌─────────────────────────────────┐
 │ Frankfurter  │──▶│ raw.fx_rates_raw│──▶│ staging.                 │──▶│ analytics.fx_rates │──▶│ analytics.fx_rates_daily_change │
 │ API (ECB)    │   │ (jsonb payload) │   │ fx_rates_validated       │   │ (clean rows only)  │   │ analytics.fx_rates_daily_filled │
-└──────────────┘   └─────────────────┘   │ (verdict per row)        │   └────────────────────┘   └─────────────────────────────────┘
-    extract            load_raw          └──────────────────────────┘        transform                   build_mart
-                                                   clean                          │                     build_filled_mart
-                                                                           quality_checks
+└──────────────┘   └─────────────────┘   │ (verdict per row)        │   └────────────────────┘   │ analytics.dim_currency, dim_date│
+    extract            load_raw          └──────────────────────────┘        transform           └─────────────────────────────────┘
+                                                   clean                          │                     build_mart
+                                                                           quality_checks               build_filled_mart
+                                                                                                        build_dimensions
 ```
 
 ## Stack
@@ -63,7 +64,8 @@ docker compose down -v
 
 ```
 create_schema → extract → load_raw → clean → transform → quality_checks ─┬→ build_mart
-                                                                         └→ build_filled_mart
+                                                                         ├→ build_filled_mart
+                                                                         └→ build_dimensions
 ```
 
 | Task | What it does |
@@ -76,6 +78,7 @@ create_schema → extract → load_raw → clean → transform → quality_check
 | `quality_checks` | Fails the run if any expected currency is missing after cleaning, and names the quarantined rows and why. Quarantined rows that do not break coverage (e.g. a currency nobody asked for) only log a warning. |
 | `build_mart` | Rebuilds `analytics.fx_rates_daily_change`: day-over-day change with `LAG()` plus a rolling z-score outlier flag. |
 | `build_filled_mart` | Rebuilds `analytics.fx_rates_daily_filled`: one row per calendar day per pair, weekend and holiday gaps forward-filled and labelled. |
+| `build_dimensions` | Upserts `analytics.dim_currency` (code, name, region) and `analytics.dim_date` (one row per calendar day the marts cover), the dimensions every mart is sliced by. |
 
 ## Data cleaning
 
@@ -158,11 +161,21 @@ deployment.
 
 ## Power BI
 
-Point Power BI at the warehouse (`localhost:5433`, database `warehouse`) and use:
+Point Power BI at the warehouse (`localhost:5433`, database `warehouse`) and
+model it as a star: three fact tables sharing two dimensions, all built in SQL
+so the BI tool only consumes them.
 
-- `analytics.fx_rates_daily_filled` for time series (filter or colour by `fill_status`)
-- `analytics.fx_rates_daily_change` for moves and the `is_outlier` flag
-- `staging.fx_rates_validated` for a data-quality view of quarantined rows
+| Role | Table | Grain |
+| --- | --- | --- |
+| Fact | `analytics.fx_rates_daily_filled` | one row per calendar day per pair (periodic snapshot, `fill_status` labels imputed days) |
+| Fact | `analytics.fx_rates_daily_change` | one row per business-day move per pair (`pct_change`, `zscore`, `is_outlier`) |
+| Fact | `staging.fx_rates_validated` | one row per parsed value per run (data-quality audit) |
+| Dimension | `analytics.dim_date` | one row per calendar day |
+| Dimension | `analytics.dim_currency` | one row per tracked currency |
+
+Relate each fact to `dim_date` (on `calendar_date`, `rate_date` and `logical_date`)
+and to `dim_currency` (on `quote_currency`), many-to-one, single direction, and
+slice only by dimension columns.
 
 ## Notes
 

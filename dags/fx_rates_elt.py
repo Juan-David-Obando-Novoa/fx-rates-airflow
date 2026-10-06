@@ -3,13 +3,15 @@ fx_rates_elt
 ============
 
 Daily ELT pipeline that lands ECB foreign-exchange reference rates into a
-Postgres warehouse, cleans and validates them, and builds two analytics marts.
+Postgres warehouse, cleans and validates them, and builds two analytics marts
+plus the shared dimensions a BI tool slices them by.
 
 Flow
 ----
     create_schema -> extract -> load_raw -> clean -> transform -> quality_checks
                                                                   -> build_mart
                                                                   -> build_filled_mart
+                                                                  -> build_dimensions
 
 Design notes
 ------------
@@ -183,6 +185,11 @@ def fx_rates_elt():
             parameters={"max_rate_age_days": MAX_RATE_AGE_DAYS},
         )
 
+    @task
+    def build_dimensions() -> None:
+        """Upsert the currency and date dimensions shared by both marts."""
+        PostgresHook(postgres_conn_id=WAREHOUSE_CONN_ID).run(read_sql("dimensions.sql"))
+
     # The logical date of each run, rendered by Airflow at execution time.
     target_date = "{{ ds }}"
 
@@ -197,7 +204,7 @@ def fx_rates_elt():
         >> transform(target_date)
         >> checks
     )
-    checks >> [build_mart(), build_filled_mart()]
+    checks >> [build_mart(), build_filled_mart(), build_dimensions()]
 
 
 fx_rates_elt()
